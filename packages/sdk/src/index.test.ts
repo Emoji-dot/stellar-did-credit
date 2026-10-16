@@ -22,6 +22,7 @@ import {
   GovernanceProposal,
   BatchResult,
   DisputeEvent,
+  ScoreEvent,
 } from "./index";
 import { xdr, Keypair } from "@stellar/stellar-sdk";
 
@@ -2723,15 +2724,31 @@ describe("StellarDIDCreditSDK", () => {
       });
       mockGetTransaction.mockResolvedValueOnce({ status: "SUCCESS" });
 
+      // Proof payload must be at least 68 bytes (68-byte trailer minimum)
+      const validProof = new Uint8Array(384 + 68); // 384-byte proof + 68-byte trailer
+
       const sdk = new StellarDIDCreditSDK(mockConfig);
       const result = await sdk.verifyScoreProof(
         { publicKey: () => subjectAddress } as unknown as Keypair,
         subjectAddress,
         600,
-        new Uint8Array([1, 2, 3]),
+        validProof,
         "C_VERIFIER"
       );
       expect(result).toBe(true);
+    });
+
+    it("throws SDKError if proof payload is too short", async () => {
+      const sdk = new StellarDIDCreditSDK(mockConfig);
+      await expect(
+        sdk.verifyScoreProof(
+          { publicKey: () => subjectAddress } as unknown as Keypair,
+          subjectAddress,
+          600,
+          new Uint8Array([1, 2, 3]),
+          "C_VERIFIER"
+        )
+      ).rejects.toThrow("Invalid proof payload: too short");
     });
   });
 
@@ -3816,5 +3833,316 @@ describe("parseScoreRecord", () => {
     expect(() => parseScoreRecord(scVal)).toThrow(
       "parseScoreRecord: missing field 'stale' in ScoreRecord",
     );
+  });
+});
+
+describe("getIssuerTier", () => {
+  beforeEach(() => {
+    mockSimulateTransaction.mockReset();
+    mockGetAccount.mockReset();
+    mockSendTransaction.mockReset();
+    mockGetTransaction.mockReset();
+    mockContractCalls.length = 0;
+    mockLastContractCall = undefined;
+    mockGetAccount.mockResolvedValue({ sequenceNumber: () => "1" });
+    mockSendTransaction.mockResolvedValue({
+      status: "PENDING",
+      hash: "mock-tx-hash",
+    });
+    mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
+    (
+      jest.requireMock("@stellar/stellar-sdk").SorobanRpc.Server as jest.Mock
+    ).mockClear();
+  });
+
+  const issuerAddress = "GISSUERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+  it("returns the default tier (100 bps) when no tier has been set", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: 100 } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const tier = await sdk.getIssuerTier(issuerAddress);
+
+    expect(tier).toBe(100);
+    expect(mockContractCalls[0]).toMatchObject({
+      contractId: mockConfig.identityOracleId,
+      method: "get_issuer_tier",
+    });
+  });
+
+  it("returns a custom tier value when one has been set", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: 200 } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const tier = await sdk.getIssuerTier(issuerAddress);
+
+    expect(tier).toBe(200);
+  });
+
+  it("throws when simulation returns an error", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      error: "Error(Contract, #11)",
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await expect(sdk.getIssuerTier(issuerAddress)).rejects.toThrow(
+      IdentityOracleError,
+    );
+  });
+
+  it("throws when simulation returns an unexpected response", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({});
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await expect(sdk.getIssuerTier(issuerAddress)).rejects.toThrow(
+      "Simulation returned unexpected response",
+    );
+  });
+});
+
+describe("setIssuerTier", () => {
+  beforeEach(() => {
+    mockSimulateTransaction.mockReset();
+    mockGetAccount.mockReset();
+    mockSendTransaction.mockReset();
+    mockGetTransaction.mockReset();
+    mockContractCalls.length = 0;
+    mockLastContractCall = undefined;
+    mockGetAccount.mockResolvedValue({ sequenceNumber: () => "1" });
+    mockSendTransaction.mockResolvedValue({
+      status: "PENDING",
+      hash: "mock-tx-hash",
+    });
+    mockGetTransaction.mockResolvedValue({ status: "SUCCESS" });
+    (
+      jest.requireMock("@stellar/stellar-sdk").SorobanRpc.Server as jest.Mock
+    ).mockClear();
+  });
+
+  const adminKeypair = {
+    publicKey: () => "GADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  };
+  const issuerAddress = "GISSUERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+  it("sets the tier and returns a transaction hash", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: null } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const txHash = await sdk.setIssuerTier(adminKeypair as never, issuerAddress, 150);
+
+    expect(txHash).toBe("mock-tx-hash");
+    expect(mockContractCalls[0]).toMatchObject({
+      contractId: mockConfig.identityOracleId,
+      method: "set_issuer_tier",
+    });
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the weight_bps as a u32 ScVal", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: null } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await sdk.setIssuerTier(adminKeypair as never, issuerAddress, 150);
+
+    const args = mockContractCalls[0]?.args;
+    // args[2] is the weightBps encoded via nativeToScVal
+    expect(args?.[2]).toMatchObject({ value: 150, type: "u32" });
+  });
+
+  it("sets the minimum valid tier (1 bps)", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: null } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const txHash = await sdk.setIssuerTier(adminKeypair as never, issuerAddress, 1);
+
+    expect(txHash).toBe("mock-tx-hash");
+    expect(mockContractCalls[0]?.args[2]).toMatchObject({ value: 1, type: "u32" });
+  });
+
+  it("sets the maximum valid tier (300 bps)", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      result: { retval: { value: null } },
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const txHash = await sdk.setIssuerTier(adminKeypair as never, issuerAddress, 300);
+
+    expect(txHash).toBe("mock-tx-hash");
+    expect(mockContractCalls[0]?.args[2]).toMatchObject({ value: 300, type: "u32" });
+  });
+
+  it("throws when simulation returns a contract error (e.g. InvalidIssuerTier)", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      error: "Error(Contract, #11)",
+    });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await expect(
+      sdk.setIssuerTier(adminKeypair as never, issuerAddress, 0),
+    ).rejects.toThrow(IdentityOracleError);
+  });
+
+  it("throws NotAuthorized when a non-admin caller is rejected by the contract", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({
+      error: "Error(Contract, #2)",
+    });
+
+    const nonAdminKeypair = {
+      publicKey: () => "GNONADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await expect(
+      sdk.setIssuerTier(nonAdminKeypair as never, issuerAddress, 150),
+    ).rejects.toThrow(IdentityOracleError);
+  });
+
+  it("throws when simulation returns an unexpected response", async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({});
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    await expect(
+      sdk.setIssuerTier(adminKeypair as never, issuerAddress, 150),
+    ).rejects.toThrow("Simulation returned unexpected response");
+  });
+});
+
+describe("subscribeToScoreEvents", () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    mockGetLatestLedger.mockReset();
+    mockGetEvents.mockReset();
+    mockGetLatestLedger.mockResolvedValue({ sequence: 200 });
+    (
+      jest.requireMock("@stellar/stellar-sdk").SorobanRpc.Server as jest.Mock
+    ).mockClear();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it("delivers a typed ScoreEvent to the callback", async () => {
+    mockGetEvents.mockResolvedValueOnce({
+      latestLedger: 200,
+      events: [
+        {
+          ledger: 200,
+          ledgerClosedAt: "2026-10-15T12:00:00Z",
+          value: { value: [subjectAddress, 720] },
+        },
+      ],
+    });
+
+    const sdk = new StellarDIDCreditSDK({ ...mockConfig, pollIntervalMs: 10 });
+    const received: ScoreEvent[] = [];
+    const unsubscribe = sdk.subscribeToScoreEvents((event) => {
+      received.push(event);
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toEqual({
+      subject: subjectAddress,
+      score: 720,
+      ledger: 200,
+      timestamp: Math.floor(new Date("2026-10-15T12:00:00Z").getTime() / 1000),
+    });
+
+    unsubscribe();
+  });
+
+  it("filters events on the creditOracleId contract with Score topic", async () => {
+    mockGetEvents.mockResolvedValueOnce({
+      latestLedger: 200,
+      events: [],
+    });
+
+    const sdk = new StellarDIDCreditSDK({ ...mockConfig, pollIntervalMs: 10 });
+    const unsubscribe = sdk.subscribeToScoreEvents(jest.fn());
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockGetEvents).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filters: [
+          {
+            type: "contract",
+            contractIds: [mockConfig.creditOracleId],
+            topics: [["symbol:Score"]],
+          },
+        ],
+      }),
+    );
+
+    unsubscribe();
+  });
+
+  it("stops polling after unsubscribe is called", async () => {
+    mockGetEvents.mockResolvedValue({ latestLedger: 200, events: [] });
+
+    const sdk = new StellarDIDCreditSDK({ ...mockConfig, pollIntervalMs: 10 });
+    const unsubscribe = sdk.subscribeToScoreEvents(jest.fn());
+
+    await Promise.resolve();
+    await Promise.resolve();
+    unsubscribe();
+
+    const callsAfterUnsubscribe = mockGetEvents.mock.calls.length;
+    await jest.advanceTimersByTimeAsync(50);
+    expect(mockGetEvents.mock.calls.length).toBe(callsAfterUnsubscribe);
+  });
+
+  it("delivers multiple events across polls", async () => {
+    mockGetEvents
+      .mockResolvedValueOnce({
+        latestLedger: 200,
+        events: [
+          {
+            ledger: 200,
+            ledgerClosedAt: "2026-10-15T12:00:00Z",
+            value: { value: [subjectAddress, 650] },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        latestLedger: 201,
+        events: [
+          {
+            ledger: 201,
+            ledgerClosedAt: "2026-10-15T12:00:05Z",
+            value: { value: [subjectAddress, 680] },
+          },
+        ],
+      });
+
+    const sdk = new StellarDIDCreditSDK({ ...mockConfig, pollIntervalMs: 10 });
+    const received: ScoreEvent[] = [];
+    const unsubscribe = sdk.subscribeToScoreEvents((event) => {
+      received.push(event);
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(received).toHaveLength(1);
+    expect(received[0]!.score).toBe(650);
+
+    await jest.advanceTimersByTimeAsync(10);
+    expect(received).toHaveLength(2);
+    expect(received[1]!.score).toBe(680);
+
+    unsubscribe();
   });
 });
